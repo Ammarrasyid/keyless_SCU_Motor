@@ -154,8 +154,8 @@ bool isNear       = false;
 
 bool contactActive          = false;
 unsigned long contactOnStartMs = 0;
-// Kontak aktif maksimal 1 menit
-const unsigned long CONTACT_MAX_ON_MS = 1UL * 60UL * 1000UL;
+// Kontak aktif maksimal 3 detik
+const unsigned long CONTACT_MAX_ON_MS = 3UL * 1000UL;
 // Tambahan: penanda bahwa di sesi BLE ini kontak PERNAH ON
 bool sessionHadContact = false;
 
@@ -512,11 +512,11 @@ void processDigitTimeout(unsigned long nowMs) {
 
     manualIndex++;
     if (manualIndex >= CODE_LEN) {
-        Serial.println("[MANUAL] KODE BENAR, CONTACT ON 1 MENIT");
+        Serial.println("[MANUAL] KODE BENAR, CONTACT ON 5 DETIK");
         ledBlink(3, 200, 150);
 
         contactActive    = true;
-        contactOnStartMs = nowMs;
+        contactOnStartMs = nowMs + 2000; // Tambah 2 detik, Jadi kontak menyala 5 detik
         sessionHadContact = true;
         digitalWrite(CONTACT_RELAY, HIGH);
 
@@ -561,7 +561,7 @@ void handleTriggerPress(unsigned long nowMs) {
         contactOnStartMs = nowMs;
         sessionHadContact = true;
         digitalWrite(CONTACT_RELAY, HIGH);
-        Serial.println("[CONTACT] AUTO ON (BLE+near+trigger, 1 menit)");
+        Serial.println("[CONTACT] AUTO ON (BLE+near+trigger, 3 detik)");
     }
 }
 
@@ -573,6 +573,14 @@ void updateIndicatorLed(unsigned long nowMs) {
     if (manualState != MANUAL_IDLE) {
         indicatorDimmingActive = false;
         battBlinkState         = false;
+        return;
+    }
+
+    // Indikator hanya aktif jika jarak valid (< threshold 2 m)
+    if (!isNear) {
+        indicatorDimmingActive = false;
+        battBlinkState         = false;
+        indicatorSet(0);
         return;
     }
 
@@ -695,12 +703,12 @@ void loop() {
     // Timeout digit PIN manual
     processDigitTimeout(nowMs);
 
-    // CONTACT relay timeout 1 menit
+    // CONTACT relay timeout 3 detik
     if (contactActive) {
         if (nowMs - contactOnStartMs >= CONTACT_MAX_ON_MS) {
             contactActive = false;
             digitalWrite(CONTACT_RELAY, LOW);
-            Serial.println("[CONTACT] OFF (timeout 1 menit)");
+            Serial.println("[CONTACT] OFF (timeout 3 detik)");
         }
     }
 
