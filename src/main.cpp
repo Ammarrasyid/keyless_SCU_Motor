@@ -143,19 +143,22 @@ static const size_t ITAG_MFG_PREFIX_LEN =
 // ======================================================================
 //  JARAK (RSSI) & CONTACT
 // ======================================================================
-#define RSSI_NEAR_THRESHOLD -72
-#define RSSI_FAR_THRESHOLD  -75
+#define RSSI_NEAR_THRESHOLD -70
+#define RSSI_FAR_THRESHOLD  -72
 
 float rssiAvg = -100.0f;
 unsigned long lastRssiUpdate = 0;
 
 bool bleConnected = false;
 bool isNear       = false;
+uint8_t nearFalseCount = 0;   // hitung berapa kali status isNear = false pada update RSSI
 
 bool contactActive          = false;
 unsigned long contactOnStartMs = 0;
-// Kontak aktif maksimal 3 detik
-const unsigned long CONTACT_MAX_ON_MS = 3UL * 1000UL;
+// Durasi kontak: auto 3 detik, manual 5 detik
+const unsigned long CONTACT_AUTO_ON_MS   = 3UL * 1000UL;
+const unsigned long CONTACT_MANUAL_ON_MS = 7UL * 1000UL;
+unsigned long contactDurationMs = CONTACT_AUTO_ON_MS;
 // Tambahan: penanda bahwa di sesi BLE ini kontak PERNAH ON
 bool sessionHadContact = false;
 
@@ -223,9 +226,9 @@ bool          indicatorDimmingActive = false;
 bool          indicatorDimmingUp     = true;
 unsigned long lastDimStepMs          = 0;
 const uint8_t       DIM_MIN               = 30;
-const uint8_t       DIM_MAX               = 255;
+const uint8_t       DIM_MAX               = 200;
 const uint8_t       DIM_STEP              = 2;
-const unsigned long DIM_STEP_INTERVAL_MS  = 1;
+const unsigned long DIM_STEP_INTERVAL_MS  = 10;
 
 // state untuk low battery blinking
 unsigned long lastBattBlinkMs = 0;
@@ -332,6 +335,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
 
         bleConnected      = false;
         isNear            = false;
+        nearFalseCount    = 0;
         contactActive     = false;
         sessionHadContact = false;          // <-- reset flag sesi
         digitalWrite(CONTACT_RELAY, LOW);
@@ -512,11 +516,12 @@ void processDigitTimeout(unsigned long nowMs) {
 
     manualIndex++;
     if (manualIndex >= CODE_LEN) {
-        Serial.println("[MANUAL] KODE BENAR, CONTACT ON 5 DETIK");
+        Serial.println("[MANUAL] KODE BENAR, CONTACT ON 7 DETIK");
         ledBlink(3, 200, 150);
 
-        contactActive    = true;
-        contactOnStartMs = nowMs + 2000; // Tambah 2 detik, Jadi kontak menyala 5 detik
+        contactActive     = true;
+        contactDurationMs = CONTACT_MANUAL_ON_MS;
+        contactOnStartMs  = nowMs;
         sessionHadContact = true;
         digitalWrite(CONTACT_RELAY, HIGH);
 
@@ -557,8 +562,9 @@ void handleTriggerPress(unsigned long nowMs) {
 
     // MODE AUTO: sekali tekan + BLE connect + NEAR + kontak belum aktif
     if (bleConnected && isNear && !contactActive) {
-        contactActive    = true;
-        contactOnStartMs = nowMs;
+        contactActive     = true;
+        contactDurationMs = CONTACT_AUTO_ON_MS;
+        contactOnStartMs  = nowMs;
         sessionHadContact = true;
         digitalWrite(CONTACT_RELAY, HIGH);
         Serial.println("[CONTACT] AUTO ON (BLE+near+trigger, 3 detik)");
@@ -675,6 +681,7 @@ void setup() {
 // ======================================================================
 void loop() {
     unsigned long nowMs = millis();
+    bool rssiUpdated = false;
 
     // Heartbeat LED builtin (indikasi MCU hidup)
     if (nowMs - lastHBMs >= 500) {
@@ -703,12 +710,12 @@ void loop() {
     // Timeout digit PIN manual
     processDigitTimeout(nowMs);
 
-    // CONTACT relay timeout 3 detik
+    // CONTACT relay timeout (auto 3 detik, manual 5 detik)
     if (contactActive) {
-        if (nowMs - contactOnStartMs >= CONTACT_MAX_ON_MS) {
+        if (nowMs - contactOnStartMs >= contactDurationMs) {
             contactActive = false;
             digitalWrite(CONTACT_RELAY, LOW);
-            Serial.println("[CONTACT] OFF (timeout 3 detik)");
+            Serial.println("[CONTACT] OFF (timeout)");
         }
     }
 
@@ -762,6 +769,7 @@ void loop() {
     if (nowMs - lastRssiUpdate >= 400) {
         lastRssiUpdate = nowMs;
         int rssi = client->getRssi();
+        rssiUpdated = true;
 
         const float alpha = 0.2f;
         rssiAvg = alpha * rssi + (1.0f - alpha) * rssiAvg;
@@ -777,10 +785,26 @@ void loop() {
     // update isNear (hysteresis)
     if (!isNear && rssiAvg >= RSSI_NEAR_THRESHOLD) {
         isNear = true;
+        nearFalseCount = 0;
         Serial.println("[DIST] <2m → NEAR = true");
     } else if (isNear && rssiAvg <= RSSI_FAR_THRESHOLD) {
         isNear = false;
         Serial.println("[DIST] >2m → NEAR = false");
+    }
+
+    // Reset sessionHadContact setelah 5x status isNear = false (mengacu pada update RSSI)
+    if (rssiUpdated) {
+        if (!isNear) {
+            if (nearFalseCount < 20) {
+                nearFalseCount++;
+            }
+            if (nearFalseCount == 20 && sessionHadContact) {
+                sessionHadContact = false;
+                Serial.println("[DIST] NEAR false x20 → sessionHadContact reset");
+            }
+        } else {
+            nearFalseCount = 0;
+        }
     }
 
     // polling battery (fallback kalau tidak pakai notify)
