@@ -9,9 +9,10 @@ static const char* TARGET_NAME = "TNW-T26";                // optional
 
 // Relay & input pin
 #define CONTACT_RELAY    18    // Kontak utama
-#define HORN_RELAY       4    // Horn (double click)
-#define SEIN_RELAY       5    // Sein (single click)
-#define CONTACT_TRIGGER 35    // Input trigger kontak
+#define HORN_RELAY       4     // Horn (double click)
+#define SEIN_RELAY       5     // Sein (single click)
+#define CONTACT_TRIGGER  15    // Input trigger kontak (tombol ke GND, INPUT_PULLUP)
+#define INDICATOR_LED    19    // LED indikator mode manual / pemisah / error
 
 // Distance threshold
 #define RSSI_NEAR_THRESHOLD -105     // approx < 2 meter
@@ -24,7 +25,7 @@ unsigned long lastRssiUpdate = 0;
 // Notify characteristic pointer
 NimBLERemoteCharacteristic* notifyChar = nullptr;
 
-// ====== STATE DETEKSI CLICK ======
+// ====== STATE DETEKSI CLICK BLE (REMOTE) ======
 const unsigned long DOUBLE_CLICK_WINDOW = 700; // ms
 uint8_t clickFirst  = 0;
 uint8_t clickSecond = 0;
@@ -35,13 +36,40 @@ unsigned long clickStartTime = 0;
 bool bleConnected = false;
 bool isNear       = false;
 
-// ====== STATE CONTACT RELAY ======
+// ====== STATE CONTACT RELAY (AUTO & MANUAL) ======
 bool contactActive = false;
 unsigned long contactOnStartMs = 0;
 const unsigned long CONTACT_MAX_ON_MS = 3UL * 60UL * 1000UL;  // 3 menit
 
 // ====== WATCHDOG CONFIG ======
 #define WDT_TIMEOUT_SEC 10
+
+// ====== MANUAL MODE STATE (TRIGGER 3x + KODE 2-8-1-0) ======
+enum ManualState {
+    MANUAL_IDLE,
+    MANUAL_CODE
+};
+
+ManualState manualState = MANUAL_IDLE;
+
+// triple-click activation
+uint8_t       activationCount    = 0;
+unsigned long activationStartMs  = 0;
+const unsigned long ACTIVATION_WINDOW_MS = 2000; // ms
+
+// kode 2-8-1-0
+const uint8_t CODE_LEN = 4;
+const uint8_t CODE_PATTERN[CODE_LEN] = {2, 8, 1, 0};
+uint8_t       manualIndex     = 0;  // index digit yang sedang diisi
+uint8_t       digitPressCount = 0;  // jumlah tekan di digit saat ini
+unsigned long digitStartMs    = 0;
+const unsigned long DIGIT_WINDOW_MS = 3000; // ms per digit
+
+// ====== BUTTON DEBOUNCE STATE ======
+bool lastPhysicalState = HIGH;
+bool stableState       = HIGH;
+unsigned long lastChangeMs = 0;
+const unsigned long DEBOUNCE_MS = 30;
 
 // ========================================================
 // ====== KLASIFIKASI JARAK DARI RSSI (MIRIP SCANNER HP) ======
@@ -53,7 +81,17 @@ const char* classifyDistance(float rssi) {
     return "VERY_FAR (>8 m)";
 }
 
-// ===================== Notify Callback ==================
+// ===================== INDICATOR HELPERS ==================
+void ledBlink(uint8_t times, int onMs, int offMs) {
+    for (uint8_t i = 0; i < times; i++) {
+        digitalWrite(INDICATOR_LED, HIGH);
+        delay(onMs);
+        digitalWrite(INDICATOR_LED, LOW);
+        if (i < times - 1) delay(offMs);
+    }
+}
+
+// ===================== Notify Callback (BLE remote) ======
 void notifyCallback(NimBLERemoteCharacteristic* chr,
                     uint8_t* data,
                     size_t len,
@@ -88,7 +126,6 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         Serial.printf(">> CONNECTED to %s\n",
                       pClient->getPeerAddress().toString().c_str());
         bleConnected = true;
-        // isNear akan di-update oleh RSSI
     }
 
     void onDisconnect(NimBLEClient* pClient, int reason) override {
@@ -98,6 +135,11 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         isNear        = false;
         contactActive = false;
         digitalWrite(CONTACT_RELAY, LOW);
+
+        manualState       = MANUAL_IDLE;
+        activationCount   = 0;
+        manualIndex       = 0;
+        digitPressCount   = 0;
 
         notifyChar = nullptr; // reset characteristic
         NimBLEDevice::getScan()->start(5000);
@@ -166,10 +208,113 @@ void discoverServices(NimBLEClient* client)
 
                 if (chr->subscribe(true, notifyCallback, true)) {
                     notifyChar = chr;
-                    // Bisa break di sini kalau cukup satu notify
+                    // cukup satu notify
                 }
             }
         }
+    }
+}
+
+// ===================== MANUAL MODE HELPERS ==================
+void resetManual(bool errorBlink) {
+    manualState     = MANUAL_IDLE;
+    activationCount = 0;
+    manualIndex     = 0;
+    digitPressCount = 0;
+
+    if (errorBlink) {
+        Serial.println("[MANUAL] Kode salah, reset");
+        ledBlink(3, 100, 80); // blink cepat 3x
+    }
+}
+
+// dipanggil saat triple-click sudah terdeteksi
+void startManualCode(unsigned long nowMs) {
+    manualState     = MANUAL_CODE;
+    manualIndex     = 0;
+    digitPressCount = 0;
+    digitStartMs    = nowMs;
+
+    Serial.println("[MANUAL] Mode manual aktif, masukkan kode 2-8-1-0");
+    ledBlink(3, 150, 150); // indikator masuk manual
+}
+
+// proses digit saat window habis
+void processDigitTimeout(unsigned long nowMs) {
+    if (manualState != MANUAL_CODE) return;
+    if (nowMs - digitStartMs <= DIGIT_WINDOW_MS) return;
+
+    uint8_t expected = CODE_PATTERN[manualIndex];
+    uint8_t actual   = digitPressCount;
+
+    Serial.printf("[MANUAL] Digit %u: input=%u, expected=%u\n",
+                  manualIndex, actual, expected);
+
+    if (actual != expected) {
+        // salah → reset total
+        resetManual(true);
+        return;
+    }
+
+    // digit benar → blink pemisah
+    ledBlink(1, 150, 0);
+
+    manualIndex++;
+    if (manualIndex >= CODE_LEN) {
+        // semua digit benar → sukses
+        Serial.println("[MANUAL] KODE BENAR, CONTACT ON 3 MENIT");
+        ledBlink(3, 200, 150);
+
+        contactActive    = true;
+        contactOnStartMs = nowMs;
+        digitalWrite(CONTACT_RELAY, HIGH);
+
+        resetManual(false); // keluar dari mode manual (tapi contact tetap ON)
+    } else {
+        // lanjut ke digit berikutnya
+        digitPressCount = 0;
+        digitStartMs    = nowMs;
+    }
+}
+
+// dipanggil saat terdeteksi 1x tekan (rising edge)
+void handleButtonPress(unsigned long nowMs) {
+    // jika lagi input kode manual → hitung sebagai digit
+    if (manualState == MANUAL_CODE) {
+        digitPressCount++;
+        Serial.printf("[MANUAL] digitPressCount = %u\n", digitPressCount);
+        return;
+    }
+
+    // ====== TRIPLE-CLICK DETECTION (aktifkan manual mode) ======
+    if (activationCount == 0) {
+        activationStartMs = nowMs;
+    }
+
+    // kalau jeda terlalu lama, mulai hitungan baru
+    if (nowMs - activationStartMs > ACTIVATION_WINDOW_MS) {
+        activationCount   = 0;
+        activationStartMs = nowMs;
+    }
+
+    activationCount++;
+
+    Serial.printf("[MANUAL] activationCount = %u\n", activationCount);
+
+    if (activationCount >= 3) {
+        // masuk manual mode
+        startManualCode(nowMs);
+        activationCount = 0;
+        return;
+    }
+
+    // ====== AUTO CONTACT MODE (tekan sekali) ======
+    // Hanya kalau BLE connect + near + contact belum aktif
+    if (bleConnected && isNear && !contactActive) {
+        contactActive    = true;
+        contactOnStartMs = nowMs;
+        digitalWrite(CONTACT_RELAY, HIGH);
+        Serial.println("[CONTACT] AUTO ON (BLE+near+trigger)");
     }
 }
 
@@ -179,14 +324,16 @@ void setup() {
     Serial.println("=== ESP32 BLE Async Client (TNW-T26 CONTROL) ===");
 
     pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(INDICATOR_LED, OUTPUT);
     pinMode(CONTACT_RELAY, OUTPUT);
     pinMode(HORN_RELAY, OUTPUT);
     pinMode(SEIN_RELAY, OUTPUT);
-    pinMode(CONTACT_TRIGGER, INPUT_PULLUP); // kalau pakai pull-up, ubah ke INPUT_PULLUP // perlu dikasih resistor eksternal
+    pinMode(CONTACT_TRIGGER, INPUT_PULLUP); // tombol ke GND
 
     digitalWrite(CONTACT_RELAY, LOW);
     digitalWrite(HORN_RELAY, LOW);
     digitalWrite(SEIN_RELAY, LOW);
+    digitalWrite(INDICATOR_LED, LOW);
 
     // Watchdog init untuk task utama (loop)
     esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
@@ -204,24 +351,25 @@ void setup() {
 }
 
 // ===================== LOOP ==============================
-unsigned long lastTime;
-bool triggerState = false;
+unsigned long lastBlinkMs = 0;
+bool ledState = false;
+
 void loop() {
     // Feed watchdog
     esp_task_wdt_reset();
 
-    // LED built-in toggle
-    static bool loop = true;
-    digitalWrite(LED_BUILTIN, loop);
-    unsigned long timeNow = millis();
-    if (timeNow - lastTime >= 500) {
-        lastTime = timeNow;
-        loop = !loop;
+    unsigned long nowMs = millis();
+
+    // Heartbeat LED_BUILTIN
+    if (nowMs - lastBlinkMs >= 500) {
+        lastBlinkMs = nowMs;
+        ledState = !ledState;
+        digitalWrite(LED_BUILTIN, ledState);
     }
 
     auto clients = NimBLEDevice::getConnectedClients();
     if (!clients.size()) {
-        delay(50);
+        delay(20);
         return;
     }
 
@@ -234,20 +382,17 @@ void loop() {
         return;
     }
 
-    // ---- EVALUASI SINGLE / DOUBLE CLICK SETELAH WINDOW ----
+    // ---- EVALUASI SINGLE / DOUBLE CLICK (REMOTE BLE) ----
     if (waitingClickEval) {
-        unsigned long now = millis();
-        if (now - clickStartTime > DOUBLE_CLICK_WINDOW) {
+        if (nowMs - clickStartTime > DOUBLE_CLICK_WINDOW) {
             waitingClickEval = false;
 
             uint8_t first  = clickFirst;
             uint8_t second = clickSecond;
 
-            // reset buffer
             clickFirst  = 0;
             clickSecond = 0;
 
-            // Double click: 1→2 atau 2→1
             if ((first == 1 && second == 2) ||
                 (first == 2 && second == 1))
             {
@@ -260,7 +405,6 @@ void loop() {
                 delay(300);
                 digitalWrite(HORN_RELAY, LOW);
             }
-            // Single click
             else if (first != 0 && second == 0) {
                 Serial.println("[ACTION] SINGLE CLICK → SEIN BLINK 2x");
                 for (int i = 0; i < 2; i++) {
@@ -274,8 +418,8 @@ void loop() {
     }
 
     // ---- RSSI SMOOTHING & ZONA JARAK ----
-    if (millis() - lastRssiUpdate >= 700) {
-        lastRssiUpdate = millis();
+    if (nowMs - lastRssiUpdate >= 700) {
+        lastRssiUpdate = nowMs;
         int rssi = client->getRssi();
 
         const float alpha = 0.2f;
@@ -298,29 +442,33 @@ void loop() {
         Serial.println("[DIST] >2m → NEAR = false");
     }
 
-    // ---- CONTACT RELAY LOGIC ----
-    triggerState = digitalRead(CONTACT_TRIGGER);
-    // Serial.printf("[CONTACT] Trigger state = %d\n", triggerState);
-    // if (digitalRead(CONTACT_TRIGGER) == 1) triggerState = true; // sesuaikan dengan wiring
-    // static bool lastTriggerState = false;
-    unsigned long nowMs = millis();
+    // ---- READ BUTTON + DEBOUNCE + RISING EDGE ----
+    int reading = digitalRead(CONTACT_TRIGGER);  // HIGH idle, LOW pressed
 
-    if (contactActive) {
-        bool timeout = (nowMs - contactOnStartMs >= CONTACT_MAX_ON_MS);
+    if (reading != lastPhysicalState) {
+        lastChangeMs = nowMs;
+        lastPhysicalState = reading;
+    }
 
-        if (timeout) {
-            contactActive = false;
-            digitalWrite(CONTACT_RELAY, LOW);
-            Serial.println("[CONTACT] OFF (timeout)");
-        }
-    } else {
-        // Aktifkan kontak jika semua kondisi terpenuhi
-        if (bleConnected && isNear && triggerState) {
-            contactActive     = true;
-            contactOnStartMs  = nowMs;
-            digitalWrite(CONTACT_RELAY, HIGH);
-            Serial.println("[CONTACT] ON (trigger + BLE + near)");
+    if ((nowMs - lastChangeMs) > DEBOUNCE_MS && reading != stableState) {
+        stableState = reading;
+        if (stableState == LOW) {
+            // tombol baru saja ditekan (rising edge logis)
+            handleButtonPress(nowMs);
         }
     }
-    delay(10);
+
+    // ---- PROSES TIMEOUT DIGIT KODE MANUAL ----
+    processDigitTimeout(nowMs);
+
+    // ---- CONTACT RELAY TIMEOUT (AUTO & MANUAL) ----
+    if (contactActive) {
+        if (nowMs - contactOnStartMs >= CONTACT_MAX_ON_MS) {
+            contactActive = false;
+            digitalWrite(CONTACT_RELAY, LOW);
+            Serial.println("[CONTACT] OFF (timeout 3 menit)");
+        }
+    }
+
+    delay(5);
 }
