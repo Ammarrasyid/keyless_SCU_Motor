@@ -6,13 +6,9 @@
 //  OPSI MODE / DEBUG
 // ======================================================================
 
-// Uncomment kalau mau mode scan-only (lihat MAC, services, MFG):
 // #define ScanForGetMac
-
-// Uncomment kalau mau print payload BLE detail (HEX, battery, klik dll):
 // #define ReadMessage
 
-// Master switch untuk log verbose (state internal, discover, dsb.)
 #define DEBUG_VERBOSE 0
 
 #if DEBUG_VERBOSE
@@ -23,8 +19,7 @@
   #define DBGLN(x)
 #endif
 
-// Banyak ESP32-C3 Super Mini: LED builtin di GPIO8, aktif LOW
-#define LED_BUILTIN 8
+#define LED_BUILTIN 8   // ESP32-C3 Super Mini builtin LED (aktif LOW)
 
 // ======================================================================
 //  MODE SCAN-ONLY: ScanForGetMac
@@ -40,7 +35,6 @@ class ScanCallbacks : public NimBLEScanCallbacks {
         Serial.printf("Device: %-20s  MAC: %s  RSSI: %d dBm\n",
                       name.c_str(), addr.c_str(), rssi);
 
-        // Service UUID yang di-adv
         if (dev->haveServiceUUID()) {
             Serial.print("  Services: ");
             uint8_t count = dev->getServiceUUIDCount();
@@ -52,7 +46,6 @@ class ScanCallbacks : public NimBLEScanCallbacks {
             Serial.println();
         }
 
-        // Manufacturer Data
         std::string mfg = dev->getManufacturerData();
         if (!mfg.empty()) {
             Serial.print("  MFG: ");
@@ -67,8 +60,7 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 
     void onScanEnd(const NimBLEScanResults& results, int reason) override {
         Serial.println("Scan ended, restarting...");
-        // start(durationSeconds, isContinue, restart)
-        NimBLEDevice::getScan()->start(0, true, false); // 0 = tanpa timeout
+        NimBLEDevice::getScan()->start(0, true, false);
     }
 } scanCallbacks;
 
@@ -79,14 +71,13 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
 
     NimBLEDevice::init("ScanMAC-C3");
-    NimBLEDevice::setPower(3);  // +3 dB
+    NimBLEDevice::setPower(3);
 
     NimBLEScan* scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(&scanCallbacks);
     scan->setInterval(45);
     scan->setWindow(30);
     scan->setActiveScan(true);
-
     scan->start(0, true, false);
 }
 
@@ -98,7 +89,7 @@ void loop() {
     if (now - lastBlink >= 500) {
         lastBlink = now;
         led = !led;
-        digitalWrite(LED_BUILTIN, led ? LOW : HIGH); // aktif LOW
+        digitalWrite(LED_BUILTIN, led ? LOW : HIGH);
     }
 
     delay(50);
@@ -111,20 +102,15 @@ void loop() {
 //  KONFIGURASI BLE / ITAG
 // ======================================================================
 
-// MAC iTAG dari hasil scan
 static const char* TARGET_MAC  = "f4:a9:05:54:53:48";
 
-// Service / Char iTAG untuk tombol
 static const uint16_t ITAG_SERVICE_UUID = 0xFFE0;
 static const uint16_t ITAG_CHAR_UUID    = 0xFFE1;
 
-// Battery Service
 static const uint16_t BATTERY_SERVICE_UUID = 0x180F;
 static const uint16_t BATTERY_CHAR_UUID    = 0x2A19;
 
-// Manufacturer Data prefix dari iTAG
-// Hasil scan: 05 01 F4 A9 05 54 53 48 66 02 01 03 00
-// Pakai 8 byte pertama buat anti-spoof MAC clone
+// MFG prefix anti-spoof
 static const uint8_t ITAG_MFG_PREFIX[] = {
     0x05, 0x01, 0xF4, 0xA9, 0x05, 0x54, 0x53, 0x48
 };
@@ -132,35 +118,46 @@ static const size_t ITAG_MFG_PREFIX_LEN =
     sizeof(ITAG_MFG_PREFIX) / sizeof(ITAG_MFG_PREFIX[0]);
 
 // ======================================================================
-//  PIN ESP32-C3 SUPER MINI (sesuaikan dengan wiring lo)
+//  PIN ESP32-C3 SUPER MINI
 // ======================================================================
-#define CONTACT_RELAY    0      // Kontak utama
-#define SEIN_RELAY       1      // Sein (single click iTAG)
-#define HORN_RELAY       4      // Horn (double/multi click iTAG)
-#define INDICATOR_LED    3      // LED indikator (manual / low batt / dimming)
-#define CONTACT_TRIGGER  10     // Tombol trigger ke GND (INPUT_PULLUP)
+#define CONTACT_RELAY    0
+#define SEIN_RELAY       1
+#define HORN_RELAY       4
+#define INDICATOR_LED    3
+#define CONTACT_TRIGGER  10
 
 // ======================================================================
 //  JARAK (RSSI) & CONTACT
 // ======================================================================
-#define RSSI_NEAR_THRESHOLD -70
+#define RSSI_NEAR_THRESHOLD -71
 #define RSSI_FAR_THRESHOLD  -72
 
-float rssiAvg = -100.0f;
-unsigned long lastRssiUpdate = 0;
+float         rssiAvg         = -100.0f;
+unsigned long lastRssiUpdate  = 0;
 
-bool bleConnected = false;
-bool isNear       = false;
-uint8_t nearFalseCount = 0;   // hitung berapa kali status isNear = false pada update RSSI
+bool    bleConnected   = false;
+bool    isNear         = false;
+uint8_t nearFalseCount = 0;
 
-bool contactActive          = false;
-unsigned long contactOnStartMs = 0;
-// Durasi kontak: auto 3 detik, manual 5 detik
+bool          contactActive      = false;
+unsigned long contactOnStartMs   = 0;
 const unsigned long CONTACT_AUTO_ON_MS   = 3UL * 1000UL;
 const unsigned long CONTACT_MANUAL_ON_MS = 7UL * 1000UL;
-unsigned long contactDurationMs = CONTACT_AUTO_ON_MS;
-// Tambahan: penanda bahwa di sesi BLE ini kontak PERNAH ON
-bool sessionHadContact = false;
+unsigned long       contactDurationMs    = CONTACT_AUTO_ON_MS;
+bool                sessionHadContact    = false;
+
+// ======================================================================
+//  ADAPTIVE SCAN STATE
+// ======================================================================
+enum ScanMode {
+    SCAN_MODE_AGGRESSIVE,
+    SCAN_MODE_SLOW
+};
+
+ScanMode      currentScanMode           = SCAN_MODE_AGGRESSIVE;
+// Timer untuk patokan kapan kita terakhir kali start AGGRESSIVE scan.
+// Dipakai buat hitung 30 detik ke SLOW.
+unsigned long lastAggressiveScanStartMs = 0;
 
 // ======================================================================
 //  BATTERY STATE
@@ -168,22 +165,30 @@ bool sessionHadContact = false;
 int  batteryPercent      = -1;
 bool batteryLow          = false;
 unsigned long lastBattPollMs = 0;
-const unsigned long BATTERY_POLL_MS = 60000; // 60 detik
+const unsigned long BATTERY_POLL_MS = 60000;
 
 // ======================================================================
 //  TOMBOL TRIGGER FISIK
 // ======================================================================
-bool lastPhysicalState = HIGH;
-bool stableState       = HIGH;
-unsigned long lastChangeMs = 0;
+bool          lastPhysicalState = HIGH;
+bool          stableState       = HIGH;
+unsigned long lastChangeMs      = 0;
 const unsigned long DEBOUNCE_MS = 30;
+
+// ======================================================================
+//  5x TRIGGER RESTART ESP
+// ======================================================================
+uint8_t       rebootTriggerCount   = 0;
+unsigned long rebootWindowStartMs  = 0;
+const unsigned long REBOOT_WINDOW_MS      = 5000;
+const uint8_t       REBOOT_TRIGGER_TARGET = 5;
 
 // ======================================================================
 //  KLIK ITAG → SINGLE / MULTI
 // ======================================================================
-volatile uint8_t  clickCount    = 0;
+volatile uint8_t  clickCount       = 0;
 volatile unsigned long lastClickMs = 0;
-unsigned long lastBtnDedupMs    = 0;
+unsigned long lastBtnDedupMs       = 0;
 const unsigned long BTN_DEBOUNCE_MS  = 150;
 const unsigned long CLICK_WINDOW_MS  = 400;
 
@@ -198,9 +203,9 @@ ManualState manualState = MANUAL_IDLE;
 
 uint8_t       activationCount    = 0;
 unsigned long activationStartMs  = 0;
-const unsigned long ACTIVATION_WINDOW_MS = 2000;
+const unsigned long ACTIVATION_WINDOW_MS = 5000;
+bool manual_mode = false;
 
-// PIN: 2-3-1-0
 const uint8_t CODE_LEN               = 4;
 const uint8_t CODE_PATTERN[CODE_LEN] = {2, 3, 1, 0};
 
@@ -210,17 +215,14 @@ unsigned long digitStartMs    = 0;
 const unsigned long DIGIT_WINDOW_MS = 5000;
 
 // ======================================================================
-//  KARAKTERISTIK BLE (BUTTON & BATTERY)
+//  KARAKTERISTIK BLE
 // ======================================================================
 NimBLERemoteCharacteristic* gButtonChar = nullptr;
 NimBLERemoteCharacteristic* gBattChar   = nullptr;
 
 // ======================================================================
-//  PWM / DIMMING UNTUK INDICATOR_LED (pakai analogWrite)
+//  PWM / DIMMING INDICATOR_LED (analogWrite style)
 // ======================================================================
-
-// Dimming “nafas”: level 0–255 (0 = OFF, 255 = full brightness, secara logis)
-// Karena LED aktif LOW, nanti dibalik di indicatorSet().
 uint8_t       indicatorLevel         = 0;
 bool          indicatorDimmingActive = false;
 bool          indicatorDimmingUp     = true;
@@ -230,18 +232,15 @@ const uint8_t       DIM_MAX               = 200;
 const uint8_t       DIM_STEP              = 2;
 const unsigned long DIM_STEP_INTERVAL_MS  = 10;
 
-// state untuk low battery blinking
 unsigned long lastBattBlinkMs = 0;
 bool          battBlinkState  = false;
 
-// helper: set indikator via analogWrite (0..255 logical)
-// LED aktif LOW → duty fisik = 255 - level
 inline void indicatorSet(uint8_t level) {
-    analogWrite(INDICATOR_LED, 255 - level);
+    analogWrite(INDICATOR_LED, 255 - level); // aktif LOW
 }
 
 // ======================================================================
-//  UTILITAS: klasifikasi jarak (buat log doang)
+//  UTILITAS
 // ======================================================================
 const char* classifyDistance(float rssi) {
     if (rssi >= -60)  return "VERY_NEAR (~0.5 m)";
@@ -251,17 +250,18 @@ const char* classifyDistance(float rssi) {
     return "VERY_FAR (>8 m)";
 }
 
-// ======================================================================
-//  UTILITAS: blink LED indikator (blocking, dipakai event penting)
-// ======================================================================
 void ledBlink(uint8_t times, int onMs, int offMs) {
     for (uint8_t i = 0; i < times; i++) {
-        indicatorSet(255);   // ON
+        indicatorSet(255);
         delay(onMs);
-        indicatorSet(0);     // OFF
+        indicatorSet(0);
         if (i < times - 1) delay(offMs);
     }
 }
+
+// Forward declaration
+void configureScanAggressive(unsigned long nowMs);
+void configureScanSlow();
 
 // ======================================================================
 //  NOTIFY CALLBACK
@@ -275,7 +275,6 @@ void notifyCallback(NimBLERemoteCharacteristic* chr,
 
     NimBLEUUID chrId = chr->getUUID();
 
-    // Battery characteristic (2A19)
     if (chrId.equals(NimBLEUUID(BATTERY_CHAR_UUID))) {
         uint8_t level = data[0];
         batteryPercent = level;
@@ -287,9 +286,8 @@ void notifyCallback(NimBLERemoteCharacteristic* chr,
         return;
     }
 
-    // Button iTAG (FFE1)
     if (!chrId.equals(NimBLEUUID(ITAG_CHAR_UUID))) {
-        return; // bukan dari karakteristik tombol
+        return;
     }
 
     uint8_t val       = data[0];
@@ -307,10 +305,8 @@ void notifyCallback(NimBLERemoteCharacteristic* chr,
     Serial.println("==========================");
 #endif
 
-    // iTAG: biasanya kirim 0x01 untuk klik (kadang 2 notif/klik)
     if (val == 0x01) {
         if (now - lastBtnDedupMs < BTN_DEBOUNCE_MS) {
-            // notif duplikat klik yang sama → diabaikan
             return;
         }
         lastBtnDedupMs = now;
@@ -337,7 +333,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         isNear            = false;
         nearFalseCount    = 0;
         contactActive     = false;
-        sessionHadContact = false;          // <-- reset flag sesi
+        sessionHadContact = false;
         digitalWrite(CONTACT_RELAY, LOW);
 
         manualState       = MANUAL_IDLE;
@@ -348,17 +344,19 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         gButtonChar = nullptr;
         gBattChar   = nullptr;
 
-        // pastikan indikator juga kembali normal
         indicatorDimmingActive = false;
         battBlinkState         = false;
         indicatorSet(0);
 
-        NimBLEDevice::getScan()->start(5000);
+        // Setelah putus, mulai dari aggressive lagi,
+        // dan timer 30 detik dihitung dari sini.
+        unsigned long nowMs = millis();
+        configureScanAggressive(nowMs);
     }
 } clientCallbacks;
 
 // ======================================================================
-//  SCAN CALLBACKS (FILTER MAC + SERVICE + MFG PREFIX)
+//  SCAN CALLBACKS
 // ======================================================================
 class ScanCallbacks : public NimBLEScanCallbacks {
     bool matchManufacturer(const NimBLEAdvertisedDevice* dev) {
@@ -374,18 +372,16 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 
         String mac = dev->getAddress().toString().c_str();
         if (mac != TARGET_MAC) {
-            return; // MAC beda
+            return;
         }
 
-        // Harus advertise service FFE0
         if (!(dev->haveServiceUUID() &&
               dev->isAdvertisingService(NimBLEUUID(ITAG_SERVICE_UUID)))) {
             DBGLN(">> MATCH MAC tapi service FFE0 tidak ada → ignore");
             return;
         }
 
-        // Filter manufacturer prefix
-        if (!matchManufacturer(dev)) {
+        if (!matchManufacturer(dev) && currentScanMode == SCAN_MODE_AGGRESSIVE) {
             DBGLN(">> MATCH MAC + service, MFG beda → ignore");
             return;
         }
@@ -420,13 +416,40 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 } scanCallbacks;
 
 // ======================================================================
-//  DISCOVER SERVICES: ambil langsung service/char FFE0/FFE1 & 180F/2A19
+//  PENGATUR SCAN MODE
+// ======================================================================
+void configureScanAggressive(unsigned long nowMs) {
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    scan->stop();
+    scan->setInterval(45);
+    scan->setWindow(45);
+    scan->setActiveScan(true);
+    scan->start(5000);
+
+    currentScanMode           = SCAN_MODE_AGGRESSIVE;
+    lastAggressiveScanStartMs = nowMs;  // RESET timer 30 detik di sini
+    DBGLN("[SCAN] Aggressive scan configured");
+}
+
+void configureScanSlow() {
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    scan->stop();
+    scan->setInterval(320);
+    scan->setWindow(40);
+    scan->setActiveScan(false);
+    scan->start(5000);
+
+    currentScanMode = SCAN_MODE_SLOW;
+    DBGLN("[SCAN] Slow (passive) scan configured");
+}
+
+// ======================================================================
+//  DISCOVER SERVICES
 // ======================================================================
 void discoverServices(NimBLEClient* client)
 {
     DBGLN(">> Discovering services...");
 
-    // Service tombol iTAG (FFE0)
     NimBLERemoteService* svcButton =
         client->getService(NimBLEUUID(ITAG_SERVICE_UUID));
     if (svcButton) {
@@ -448,7 +471,6 @@ void discoverServices(NimBLEClient* client)
         Serial.println("!! SERVICE FFE0 (iTAG) tidak ditemukan");
     }
 
-    // Battery service (180F) / 2A19
     NimBLERemoteService* svcBatt =
         client->getService(NimBLEUUID(BATTERY_SERVICE_UUID));
     if (svcBatt) {
@@ -472,7 +494,7 @@ void discoverServices(NimBLEClient* client)
 }
 
 // ======================================================================
-//  MODE MANUAL: triple trigger + PIN 2-3-1-0
+//  MODE MANUAL
 // ======================================================================
 void resetManual(bool errorBlink) {
     manualState     = MANUAL_IDLE;
@@ -511,7 +533,6 @@ void processDigitTimeout(unsigned long nowMs) {
         return;
     }
 
-    // digit benar → blink pemisah
     ledBlink(1, 150, 0);
 
     manualIndex++;
@@ -532,16 +553,48 @@ void processDigitTimeout(unsigned long nowMs) {
     }
 }
 
-// Dipanggil saat trigger fisik ditekan (rising edge)
+// ======================================================================
+//  HANDLE TRIGGER
+// ======================================================================
 void handleTriggerPress(unsigned long nowMs) {
-    // Kalau lagi input kode manual → hitung sebagai digit
+    // 5x trigger dalam 5 detik → restart
+    if (rebootTriggerCount == 0 || (nowMs - rebootWindowStartMs > REBOOT_WINDOW_MS)) {
+        rebootTriggerCount  = 0;
+        rebootWindowStartMs = nowMs;
+    }
+    rebootTriggerCount++;
+
+    DBG("[REBOOT] count=%u, window=%lu ms\n",
+        rebootTriggerCount, nowMs - rebootWindowStartMs);
+
+    if (rebootTriggerCount == REBOOT_TRIGGER_TARGET) {
+        Serial.println("[SYS] 5x trigger dalam 5 detik → RESTART");
+
+        ledBlink(1, 150, 150);
+        indicatorSet(255);
+        delay(700);
+        indicatorSet(0);
+        delay(300);
+        ledBlink(2, 150, 150);
+        delay(100);
+
+        ESP.restart();
+    }
+
+    // Adaptive scan: kalau lagi SLOW & belum connect → paksa AGGRESSIVE
+    if (!bleConnected && currentScanMode == SCAN_MODE_SLOW) {
+        Serial.println("[SCAN] Trigger → switch ke AGGRESSIVE scan");
+        configureScanAggressive(nowMs);  
+    }
+
+    // Kalau lagi input kode manual, klik ini dihitung sebagai digit
     if (manualState == MANUAL_CODE) {
         digitPressCount++;
         DBG("[MANUAL] digitPressCount = %u\n", digitPressCount);
         return;
     }
 
-    // triple click untuk masuk mode manual
+    // Triple trigger → masuk mode manual
     if (activationCount == 0) {
         activationStartMs = nowMs;
     }
@@ -554,13 +607,11 @@ void handleTriggerPress(unsigned long nowMs) {
     activationCount++;
     DBG("[MANUAL] activationCount = %u\n", activationCount);
 
-    if (activationCount >= 3) {
-        startManualCode(nowMs);
-        activationCount = 0;
-        return;
+    if (activationCount == 3) {
+        manual_mode = true;
     }
 
-    // MODE AUTO: sekali tekan + BLE connect + NEAR + kontak belum aktif
+    // Mode auto: satu trigger + BLE connect + NEAR + kontak belum aktif
     if (bleConnected && isNear && !contactActive) {
         contactActive     = true;
         contactDurationMs = CONTACT_AUTO_ON_MS;
@@ -572,17 +623,15 @@ void handleTriggerPress(unsigned long nowMs) {
 }
 
 // ======================================================================
-//  INDICATOR LED STATE MACHINE (LOW BATTERY + DIMMING CONTACT)
+//  INDICATOR STATE MACHINE
 // ======================================================================
 void updateIndicatorLed(unsigned long nowMs) {
-    // Saat manual mode aktif, indikator dipakai oleh ledBlink → jangan ganggu
     if (manualState != MANUAL_IDLE) {
         indicatorDimmingActive = false;
         battBlinkState         = false;
         return;
     }
 
-    // Indikator hanya aktif jika jarak valid (< threshold 2 m)
     if (!isNear) {
         indicatorDimmingActive = false;
         battBlinkState         = false;
@@ -590,7 +639,6 @@ void updateIndicatorLed(unsigned long nowMs) {
         return;
     }
 
-    // PRIORITAS 1: low battery blink
     if (batteryLow) {
         indicatorDimmingActive = false;
 
@@ -602,7 +650,6 @@ void updateIndicatorLed(unsigned long nowMs) {
         return;
     }
 
-    // PRIORITAS 2: selama BLE connect dan di sesi ini CONTACT pernah ON → dimming
     if (bleConnected && sessionHadContact) {
         battBlinkState = false;
 
@@ -635,14 +682,13 @@ void updateIndicatorLed(unsigned long nowMs) {
         return;
     }
 
-    // PRIORITAS 3: default OFF
     indicatorDimmingActive = false;
     battBlinkState         = false;
     indicatorSet(0);
 }
 
 // ======================================================================
-//  SETUP
+//  SETUP & LOOP
 // ======================================================================
 unsigned long lastHBMs   = 0;
 bool          hbLedState = false;
@@ -655,14 +701,13 @@ void setup() {
     pinMode(CONTACT_RELAY, OUTPUT);
     pinMode(HORN_RELAY, OUTPUT);
     pinMode(SEIN_RELAY, OUTPUT);
-    pinMode(CONTACT_TRIGGER, INPUT_PULLUP); // tombol → GND
+    pinMode(CONTACT_TRIGGER, INPUT_PULLUP);
     pinMode(INDICATOR_LED, OUTPUT);
 
     digitalWrite(CONTACT_RELAY, LOW);
     digitalWrite(HORN_RELAY, LOW);
     digitalWrite(SEIN_RELAY, LOW);
 
-    // indikator OFF awal
     indicatorSet(0);
 
     NimBLEDevice::init("Async-Client-C3");
@@ -670,33 +715,27 @@ void setup() {
 
     NimBLEScan* scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(&scanCallbacks);
-    scan->setInterval(45);
-    scan->setWindow(45);
-    scan->setActiveScan(true);
-    scan->start(5000);
+
+    unsigned long nowMs = millis();
+    configureScanAggressive(nowMs);   // start awal dari aggressive
 }
 
-// ======================================================================
-//  LOOP
-// ======================================================================
 void loop() {
     unsigned long nowMs = millis();
     bool rssiUpdated = false;
 
-    // Heartbeat LED builtin (indikasi MCU hidup)
+    // heartbeat
     if (nowMs - lastHBMs >= 500) {
         lastHBMs = nowMs;
         hbLedState = !hbLedState;
-        digitalWrite(LED_BUILTIN, hbLedState ? LOW : HIGH); // aktif LOW
+        digitalWrite(LED_BUILTIN, hbLedState ? LOW : HIGH);
     }
 
-    // ==================== LOGIKA YANG TIDAK BERGANTUNG BLE ====================
-
-    // Tombol trigger fisik (debounce + rising edge)
-    int reading = digitalRead(CONTACT_TRIGGER);  // HIGH idle, LOW pressed
+    // ===== logic tanpa BLE =====
+    int reading = digitalRead(CONTACT_TRIGGER);
 
     if (reading != lastPhysicalState) {
-        lastChangeMs = nowMs;
+        lastChangeMs    = nowMs;
         lastPhysicalState = reading;
     }
 
@@ -706,11 +745,14 @@ void loop() {
             handleTriggerPress(nowMs);
         }
     }
+    
+    if (manual_mode && (nowMs - activationStartMs) > ACTIVATION_WINDOW_MS) {
+        manual_mode = false;
+        startManualCode(nowMs);
+    }
 
-    // Timeout digit PIN manual
     processDigitTimeout(nowMs);
 
-    // CONTACT relay timeout (auto 3 detik, manual 5 detik)
     if (contactActive) {
         if (nowMs - contactOnStartMs >= contactDurationMs) {
             contactActive = false;
@@ -719,28 +761,36 @@ void loop() {
         }
     }
 
-    // Update indikator (low battery / dimming contact)
     updateIndicatorLed(nowMs);
 
-    // ===================== BAGIAN YANG BUTUH BLE CONNECT ======================
+    // ADAPTIVE SCAN: kalau sudah 30 detik di AGGRESSIVE tanpa BLE connect → SLOW
+    if (!bleConnected &&
+        currentScanMode == SCAN_MODE_AGGRESSIVE &&
+        lastAggressiveScanStartMs != 0)
+    {
+        unsigned long timer = nowMs - lastAggressiveScanStartMs;
 
+        if (timer >= 30000UL) {
+            Serial.println("[SCAN] >30s tanpa BLE, switch ke SLOW scan");
+            configureScanSlow();
+        }
+    }
+
+    // ===== logic yang butuh BLE connect =====
     auto clients = NimBLEDevice::getConnectedClients();
     if (clients.size() == 0) {
-        // Manual mode tetap jalan walau BLE belum connect
         delay(5);
         return;
     }
 
     NimBLEClient* client = clients[0];
 
-    // sekali discover sampai dapat button & battery char
     if (!gButtonChar && !gBattChar) {
         discoverServices(client);
         delay(50);
         return;
     }
 
-    // EVALUASI single / multi click iTAG
     if (clickCount > 0 && (nowMs - lastClickMs > CLICK_WINDOW_MS)) {
         uint8_t count = clickCount;
         clickCount = 0;
@@ -765,8 +815,7 @@ void loop() {
         }
     }
 
-    // RSSI smoothing
-    if (nowMs - lastRssiUpdate >= 400) {
+    if (nowMs - lastRssiUpdate >= 1000) {
         lastRssiUpdate = nowMs;
         int rssi = client->getRssi();
         rssiUpdated = true;
@@ -782,7 +831,6 @@ void loop() {
         }
     }
 
-    // update isNear (hysteresis)
     if (!isNear && rssiAvg >= RSSI_NEAR_THRESHOLD) {
         isNear = true;
         nearFalseCount = 0;
@@ -792,22 +840,20 @@ void loop() {
         Serial.println("[DIST] >2m → NEAR = false");
     }
 
-    // Reset sessionHadContact setelah 5x status isNear = false (mengacu pada update RSSI)
     if (rssiUpdated) {
         if (!isNear) {
-            if (nearFalseCount < 20) {
+            if (nearFalseCount < 5) {
                 nearFalseCount++;
             }
-            if (nearFalseCount == 20 && sessionHadContact) {
+            if (nearFalseCount == 5 && sessionHadContact) {
                 sessionHadContact = false;
-                Serial.println("[DIST] NEAR false x20 → sessionHadContact reset");
+                Serial.println("[DIST] FAR → sessionHadContact reset");
             }
         } else {
             nearFalseCount = 0;
         }
     }
 
-    // polling battery (fallback kalau tidak pakai notify)
     if (bleConnected && gBattChar && (nowMs - lastBattPollMs >= BATTERY_POLL_MS)) {
         lastBattPollMs = nowMs;
         std::string val = gBattChar->readValue();
